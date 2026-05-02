@@ -32,6 +32,19 @@ A minimal RAG (Retrieval-Augmented Generation) backend written in Go. It ingests
 - [Go 1.21+](https://go.dev/dl/)
 - [Docker](https://www.docker.com/) (for PostgreSQL + pgvector)
 - [LM Studio](https://lmstudio.ai/) running locally with an embedding model loaded
+- **poppler-utils** — required for advanced/complex PDFs (PDF 1.5+, cross-reference streams, compressed objects)
+  ```bash
+  # Windows
+  scoop install poppler
+  # or
+  choco install poppler
+
+  # Ubuntu / Debian
+  apt install poppler-utils
+
+  # macOS
+  brew install poppler
+  ```
 
 ---
 
@@ -144,6 +157,39 @@ Embeds the query text and returns the most semantically similar stored chunks ra
 
 ---
 
+### `POST /v1/chat`
+
+Full RAG pipeline in one call: embeds the question, retrieves the top-k relevant chunks, injects them as grounded context into the LLM prompt, and returns the answer alongside the source documents used.
+
+**Request body**
+
+```json
+{
+  "message": "your question here",
+  "k": 5
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `message` | yes | Natural language question |
+| `k` | no | Number of context chunks to retrieve (default: `5`) |
+
+**Response**
+
+```json
+{
+  "answer": "Based on the provided context, the system requires...",
+  "sources": [
+    { "filename": "docs/manual.pdf", "chunk": "...", "score": 0.94 }
+  ]
+}
+```
+
+The LLM is instructed to answer using **only** the retrieved context and to explicitly say so when the context is insufficient — preventing hallucination.
+
+---
+
 ### `DELETE /v1/reset`
 
 Truncates all ingested data (`documents` and `file_history`) while keeping the schema intact. Files can be re-ingested afterwards.
@@ -209,6 +255,24 @@ curl -s -X POST http://localhost:8080/query \
   -d '{"query": "what are the system requirements?", "k": 3}' | jq
 ```
 
+### Chat with your documents
+
+```bash
+curl -s -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What are the deployment steps?", "k": 5}' | jq
+```
+
+```json
+{
+  "answer": "Based on the provided context, the deployment steps are: 1. Build the Docker image...",
+  "sources": [
+    { "filename": "docs/deploy-guide.pdf", "chunk": "Step 1: Build...", "score": 0.96 },
+    { "filename": "docs/readme.txt",        "chunk": "Run docker-compose...", "score": 0.91 }
+  ]
+}
+```
+
 ### Reset all ingested data
 
 ```bash
@@ -261,13 +325,29 @@ docker-compose up -d
 
 ```
 rago/
-├── main.go            # HTTP server, /ingest and /query handlers
-├── db/
-│   └── db.go          # Connection, versioned migrations, similarity search
-├── ingester/
-│   └── ingester.go    # File walking, chunking, embedding, storage
-├── docker-compose.yml # PostgreSQL + pgvector service
-├── .env               # Environment variables (loaded automatically)
+├── main.go                        # Wiring, server lifecycle, graceful shutdown
+├── internal/
+│   ├── domain/
+│   │   └── rag.go                 # Types (Document) + Repository/Embedder interfaces
+│   ├── postgres/
+│   │   └── postgres.go            # DB connect, versioned migrations, Repository impl
+│   ├── lmstudio/
+│   │   └── embedder.go            # LM Studio Embedder impl
+│   ├── service/
+│   │   └── rag.go                 # Use cases: IngestFolder, Query, Reset
+│   └── handler/
+│       └── handler.go             # HTTP handlers (depends only on domain interfaces)
+├── docker-compose.yml             # PostgreSQL + pgvector service
+├── .env                           # Environment variables (loaded automatically)
 ├── go.mod
 └── go.sum
 ```
+
+### Dependency flow
+
+```
+handler → service → domain ← postgres
+                  ↘ domain ← lmstudio
+```
+
+Each layer depends only on the `domain` interfaces — never on concrete implementations. This means the repository or embedder can be swapped (e.g. for testing) without touching any other package.

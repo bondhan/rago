@@ -1,109 +1,97 @@
 package main
 
 import (
-	"encoding/json"
-	"log"
+	"context"
+	"log/slog"
 	"net/http"
 	"os"
-
-	"rago/db"
-	"rago/ingester"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
+	"rago/internal/handler"
+	"rago/internal/lmstudio"
+	"rago/internal/postgres"
+	"rago/internal/service"
 )
 
 func init() {
-	// Load .env when present; silently ignore if missing (e.g. production).
 	_ = godotenv.Load()
 }
 
 func main() {
-	if err := db.Init(); err != nil {
-		log.Fatalf("db init: %v", err)
-	}
+	initLogger()
 
-	lmStudioURL := os.Getenv("LM_STUDIO_URL")
-	if lmStudioURL == "" {
-		lmStudioURL = "http://localhost:1234"
-	}
-	ingester.Init(lmStudioURL, os.Getenv("LM_STUDIO_MODEL"))
-
-	http.HandleFunc("/ingest", handleIngest)
-	http.HandleFunc("/query", handleQuery)
-	http.HandleFunc("/v1/reset", handleReset)
-	log.Println("Listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func handleIngest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	folder := r.URL.Query().Get("folder")
-	if folder == "" {
-		http.Error(w, "folder query param required", http.StatusBadRequest)
-		return
-	}
-
-	count, err := ingester.IngestFolder(folder)
+	// Infrastructure
+	db, err := postgres.Connect()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		slog.Error("db connect failed", "error", err)
+		os.Exit(1)
+	}
+	if err := postgres.Migrate(db); err != nil {
+		slog.Error("db migrate failed", "error", err)
+		os.Exit(1)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]int{"ingested": count}); err != nil {
-		log.Printf("encode ingest response: %v", err)
+	lmURL := os.Getenv("LM_STUDIO_URL")
+	if lmURL == "" {
+		lmURL = "http://localhost:1234"
 	}
+	embedder := lmstudio.NewEmbedder(lmURL, os.Getenv("LM_STUDIO_MODEL"))
+	chatClient := lmstudio.NewChatClient(lmURL, os.Getenv("LM_STUDIO_CHAT_MODEL"))
+
+	// Domain
+	repo := postgres.NewRepository(db)
+	svc := service.NewRAGService(repo, embedder, chatClient)
+
+	// Transport
+	mux := http.NewServeMux()
+	handler.New(svc).Register(mux)
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	// Graceful shutdown on SIGINT / SIGTERM (Ctrl+C)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		slog.Info("listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("shutdown signal received")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("server stopped")
 }
 
-func handleReset(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func initLogger() {
+	var level slog.Level
+	switch strings.ToUpper(os.Getenv("LOG_LEVEL")) {
+	case "DEBUG":
+		level = slog.LevelDebug
+	case "INFO":
+		level = slog.LevelInfo
+	case "ERROR":
+		level = slog.LevelError
+	default:
+		level = slog.LevelWarn
 	}
-	if err := db.Reset(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
-		log.Printf("encode reset response: %v", err)
-	}
-}
-
-func handleQuery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Query string `json:"query"`
-		K     int    `json:"k"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
-		return
-	}
-	if req.Query == "" {
-		http.Error(w, "query field required", http.StatusBadRequest)
-		return
-	}
-	if req.K <= 0 {
-		req.K = 5
-	}
-
-	results, err := ingester.Query(req.Query, req.K)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]any{"results": results}); err != nil {
-		log.Printf("encode query response: %v", err)
-	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	})))
 }
