@@ -3,10 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"rago/internal/domain"
@@ -327,10 +330,10 @@ func TestIngestFolderTxtFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "doc.txt"), []byte("hello world this is content for testing"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	var stored int
+	var stored atomic.Int32
 	svc := newSvc(
 		&mockRepo{storeChunkFn: func(_ context.Context, _, _ string, _ []float32) error {
-			stored++
+			stored.Add(1)
 			return nil
 		}},
 		&mockEmbedder{},
@@ -343,7 +346,7 @@ func TestIngestFolderTxtFile(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected 1 file ingested, got %d", count)
 	}
-	if stored == 0 {
+	if stored.Load() == 0 {
 		t.Error("expected chunks to be stored")
 	}
 }
@@ -387,10 +390,10 @@ func TestIngestFolderRecursive(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "root.txt"), []byte("root content"), 0644)
 	os.WriteFile(filepath.Join(sub, "nested.txt"), []byte("nested content"), 0644)
 
-	var stored int
+	var stored atomic.Int32
 	svc := newSvc(
 		&mockRepo{storeChunkFn: func(_ context.Context, _, _ string, _ []float32) error {
-			stored++
+			stored.Add(1)
 			return nil
 		}},
 		&mockEmbedder{},
@@ -600,17 +603,54 @@ func TestIngestFolderRecordFileError(t *testing.T) {
 	}
 }
 
+func TestIngestWorkersDefault(t *testing.T) {
+	os.Unsetenv("INGEST_WORKERS")
+	want := 2 * runtime.NumCPU()
+	if got := ingestWorkers(); got != want {
+		t.Errorf("expected %d workers, got %d", want, got)
+	}
+}
+
+func TestIngestWorkersEnvOverride(t *testing.T) {
+	os.Setenv("INGEST_WORKERS", "7")
+	defer os.Unsetenv("INGEST_WORKERS")
+	if got := ingestWorkers(); got != 7 {
+		t.Errorf("expected 7 workers, got %d", got)
+	}
+}
+
+func TestIngestWorkersEnvInvalidFallsBack(t *testing.T) {
+	os.Setenv("INGEST_WORKERS", "bad")
+	defer os.Unsetenv("INGEST_WORKERS")
+	want := 2 * runtime.NumCPU()
+	if got := ingestWorkers(); got != want {
+		t.Errorf("expected fallback %d workers, got %d", want, got)
+	}
+}
+
+func TestIngestWorkersEnvZeroFallsBack(t *testing.T) {
+	os.Setenv("INGEST_WORKERS", "0")
+	defer os.Unsetenv("INGEST_WORKERS")
+	want := 2 * runtime.NumCPU()
+	if got := ingestWorkers(); got != want {
+		t.Errorf("expected fallback %d workers, got %d", want, got)
+	}
+}
+
 func TestIngestFolderContextCancelled(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 5; i++ {
-		os.WriteFile(filepath.Join(dir, "doc"+string(rune('0'+i))+".txt"), []byte("content"), 0644)
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("doc%d.txt", i)), []byte("content"), 0644)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	svc := newSvc(
 		&mockRepo{isIngestedFn: func(_ context.Context, _ string) (bool, error) {
-			cancel() // cancel after first file checked
-			return false, nil
+			cancel()
+			// Return the cancellation error so errgroup propagates it to g.Wait().
+			return false, context.Canceled
 		}},
 		&mockEmbedder{},
 		&mockChat{},

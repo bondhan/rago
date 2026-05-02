@@ -11,11 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"rago/internal/domain"
 
 	"github.com/ledongthuc/pdf"
+	"golang.org/x/sync/errgroup"
 )
 
 // RAGService implements the core use cases: ingest, query, chat, reset.
@@ -29,69 +33,132 @@ func NewRAGService(repo domain.Repository, embedder domain.Embedder, chat domain
 	return &RAGService{repo: repo, embedder: embedder, chat: chat}
 }
 
+// ingestWorkers returns the concurrency level for IngestFolder.
+// Reads INGEST_WORKERS from the environment; defaults to 2 × runtime.NumCPU().
+func ingestWorkers() int {
+	if v := os.Getenv("INGEST_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 2 * runtime.NumCPU()
+}
+
+// IngestFolder scans folder recursively, then processes eligible files
+// concurrently using a worker pool sized by INGEST_WORKERS (default 2×CPU).
 func (s *RAGService) IngestFolder(ctx context.Context, folder string) (int, error) {
-	count := 0
-	err := filepath.WalkDir(folder, func(path string, d os.DirEntry, walkErr error) error {
+	// Phase 1 — collect eligible file paths (sequential, cheap).
+	var files []string
+	if err := filepath.WalkDir(folder, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
-
 		ext := strings.ToLower(filepath.Ext(d.Name()))
-		if ext != ".txt" && ext != ".pdf" {
+		if ext == ".txt" || ext == ".pdf" {
+			files = append(files, path)
+		} else {
 			slog.Debug("skipping unsupported file", "path", path)
-			return nil
 		}
-
-		relPath, _ := filepath.Rel(folder, path)
-
-		hash, err := fileHash(path)
-		if err != nil {
-			return fmt.Errorf("hash %s: %w", relPath, err)
-		}
-
-		ingested, err := s.repo.IsIngested(ctx, hash)
-		if err != nil {
-			return fmt.Errorf("check ingested %s: %w", relPath, err)
-		}
-		if ingested {
-			slog.Debug("skipping already ingested file", "file", relPath)
-			return nil
-		}
-
-		slog.Info("ingesting file", "file", relPath)
-		text, err := extractText(path, ext)
-		if err != nil {
-			return fmt.Errorf("extract %s: %w", relPath, err)
-		}
-
-		chunks := chunkText(text, 500, 100)
-		slog.Debug("chunked file", "file", relPath, "chunks", len(chunks))
-
-		for i, chunk := range chunks {
-			slog.Debug("embedding chunk", "file", relPath, "chunk", i+1, "of", len(chunks))
-			emb, err := s.embedder.Embed(ctx, chunk)
-			if err != nil {
-				return fmt.Errorf("embed %s chunk %d: %w", relPath, i+1, err)
-			}
-			if err := s.repo.StoreChunk(ctx, relPath, chunk, emb); err != nil {
-				return fmt.Errorf("store %s chunk %d: %w", relPath, i+1, err)
-			}
-		}
-
-		if err := s.repo.RecordFile(ctx, relPath, hash); err != nil {
-			return err
-		}
-		slog.Info("file ingested", "file", relPath, "chunks", len(chunks))
-		count++
 		return nil
-	})
-	return count, err
+	}); err != nil {
+		return 0, err
+	}
+
+	if len(files) == 0 {
+		return 0, nil
+	}
+
+	// Phase 2 — process files concurrently.
+	workers := ingestWorkers()
+	slog.Debug("starting concurrent ingest", "files", len(files), "workers", workers)
+
+	jobs := make(chan string, workers)
+	var count atomic.Int32
+
+	g, gctx := errgroup.WithContext(ctx)
+	for i := 0; i < workers; i++ {
+		g.Go(func() error {
+			for path := range jobs {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				ingested, err := s.processFile(gctx, folder, path)
+				if err != nil {
+					return err
+				}
+				if ingested {
+					count.Add(1)
+				}
+			}
+			return nil
+		})
+	}
+
+	// Feed jobs; stop early when context is cancelled.
+sendLoop:
+	for _, path := range files {
+		select {
+		case jobs <- path:
+		case <-gctx.Done():
+			break sendLoop
+		}
+	}
+	close(jobs)
+
+	if err := g.Wait(); err != nil {
+		return int(count.Load()), err
+	}
+	return int(count.Load()), nil
+}
+
+// processFile handles the full pipeline for a single file: hash → dedup →
+// extract → chunk → embed → store. Called concurrently from IngestFolder.
+func (s *RAGService) processFile(ctx context.Context, folder, path string) (bool, error) {
+	relPath, _ := filepath.Rel(folder, path)
+	ext := strings.ToLower(filepath.Ext(path))
+
+	hash, err := fileHash(path)
+	if err != nil {
+		return false, fmt.Errorf("hash %s: %w", relPath, err)
+	}
+
+	ingested, err := s.repo.IsIngested(ctx, hash)
+	if err != nil {
+		return false, fmt.Errorf("check ingested %s: %w", relPath, err)
+	}
+	if ingested {
+		slog.Debug("skipping already ingested file", "file", relPath)
+		return false, nil
+	}
+
+	slog.Info("ingesting file", "file", relPath)
+	text, err := extractText(path, ext)
+	if err != nil {
+		return false, fmt.Errorf("extract %s: %w", relPath, err)
+	}
+
+	chunks := chunkText(text, 500, 100)
+	slog.Debug("chunked file", "file", relPath, "chunks", len(chunks))
+
+	for i, chunk := range chunks {
+		slog.Debug("embedding chunk", "file", relPath, "chunk", i+1, "of", len(chunks))
+		emb, err := s.embedder.Embed(ctx, chunk)
+		if err != nil {
+			return false, fmt.Errorf("embed %s chunk %d: %w", relPath, i+1, err)
+		}
+		if err := s.repo.StoreChunk(ctx, relPath, chunk, emb); err != nil {
+			return false, fmt.Errorf("store %s chunk %d: %w", relPath, i+1, err)
+		}
+	}
+
+	if err := s.repo.RecordFile(ctx, relPath, hash); err != nil {
+		return false, err
+	}
+	slog.Info("file ingested", "file", relPath, "chunks", len(chunks))
+	return true, nil
 }
 
 func (s *RAGService) Query(ctx context.Context, text string, k int) ([]domain.Document, error) {
