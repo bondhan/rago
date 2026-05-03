@@ -134,6 +134,12 @@ func (s *RAGService) processFile(ctx context.Context, folder, path string) (bool
 		return false, nil
 	}
 
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", relPath, err)
+	}
+	sizeBytes := info.Size()
+
 	slog.Info("ingesting file", "file", relPath)
 	text, err := extractText(path, ext)
 	if err != nil {
@@ -154,7 +160,7 @@ func (s *RAGService) processFile(ctx context.Context, folder, path string) (bool
 		}
 	}
 
-	if err := s.repo.RecordFile(ctx, relPath, hash); err != nil {
+	if err := s.repo.RecordFile(ctx, relPath, hash, sizeBytes); err != nil {
 		return false, err
 	}
 	slog.Info("file ingested", "file", relPath, "chunks", len(chunks))
@@ -167,6 +173,10 @@ func (s *RAGService) Query(ctx context.Context, text string, k int) ([]domain.Do
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 	return s.repo.SearchSimilar(ctx, emb, k)
+}
+
+func (s *RAGService) ListUploads(ctx context.Context, page, limit int) (domain.UploadPage, error) {
+	return s.repo.ListUploads(ctx, page, limit)
 }
 
 func (s *RAGService) Reset(ctx context.Context) error {

@@ -39,9 +39,9 @@ func Connect() (*sql.DB, error) {
 }
 
 // schemaVersion must be incremented whenever the DDL below changes.
-const schemaVersion = 1
+const schemaVersion = 2
 
-// Migrate creates or skips schema objects based on a version table.
+// Migrate creates or updates schema objects using an incremental version table.
 func Migrate(db *sql.DB) error {
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -61,41 +61,57 @@ func Migrate(db *sql.DB) error {
 		return nil
 	}
 
-	slog.Info("applying schema", "from", current, "to", schemaVersion)
-	dim := getEnvInt("EMBEDDING_DIM", 768)
-	if _, err := db.Exec(fmt.Sprintf(`
-		CREATE EXTENSION IF NOT EXISTS vector;
+	slog.Info("applying schema migrations", "from", current, "to", schemaVersion)
 
-		CREATE TABLE IF NOT EXISTS file_history (
-			id          SERIAL PRIMARY KEY,
-			filename    TEXT NOT NULL,
-			hash        TEXT NOT NULL UNIQUE,
-			ingested_at TIMESTAMPTZ DEFAULT NOW()
-		);
+	if current < 1 {
+		dim := getEnvInt("EMBEDDING_DIM", 768)
+		if _, err := db.Exec(fmt.Sprintf(`
+			CREATE EXTENSION IF NOT EXISTS vector;
 
-		CREATE TABLE IF NOT EXISTS documents (
-			id        SERIAL PRIMARY KEY,
-			filename  TEXT NOT NULL,
-			chunk     TEXT NOT NULL,
-			embedding vector(%d)
-		);
+			CREATE TABLE IF NOT EXISTS file_history (
+				id          SERIAL PRIMARY KEY,
+				filename    TEXT NOT NULL,
+				hash        TEXT NOT NULL UNIQUE,
+				ingested_at TIMESTAMPTZ DEFAULT NOW()
+			);
 
-		CREATE INDEX IF NOT EXISTS documents_embedding_idx
-			ON documents USING hnsw (embedding vector_cosine_ops);
+			CREATE TABLE IF NOT EXISTS documents (
+				id        SERIAL PRIMARY KEY,
+				filename  TEXT NOT NULL,
+				chunk     TEXT NOT NULL,
+				embedding vector(%d)
+			);
 
-		CREATE INDEX IF NOT EXISTS documents_filename_idx
-			ON documents (filename);
+			CREATE INDEX IF NOT EXISTS documents_embedding_idx
+				ON documents USING hnsw (embedding vector_cosine_ops);
 
-		CREATE INDEX IF NOT EXISTS file_history_filename_idx
-			ON file_history (filename);
-	`, dim)); err != nil {
-		return fmt.Errorf("apply schema v%d: %w", schemaVersion, err)
+			CREATE INDEX IF NOT EXISTS documents_filename_idx
+				ON documents (filename);
+
+			CREATE INDEX IF NOT EXISTS file_history_filename_idx
+				ON file_history (filename);
+		`, dim)); err != nil {
+			return fmt.Errorf("apply schema v1: %w", err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations (version) VALUES (1)`); err != nil {
+			return fmt.Errorf("record schema v1: %w", err)
+		}
+		slog.Info("schema v1 applied")
 	}
 
-	if _, err := db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1)`, schemaVersion); err != nil {
-		return fmt.Errorf("record schema version: %w", err)
+	if current < 2 {
+		if _, err := db.Exec(`
+			ALTER TABLE file_history
+				ADD COLUMN IF NOT EXISTS size_bytes BIGINT NOT NULL DEFAULT 0;
+		`); err != nil {
+			return fmt.Errorf("apply schema v2: %w", err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations (version) VALUES (2)`); err != nil {
+			return fmt.Errorf("record schema v2: %w", err)
+		}
+		slog.Info("schema v2 applied")
 	}
-	slog.Info("schema applied", "version", schemaVersion, "embedding_dim", dim)
+
 	return nil
 }
 
@@ -152,12 +168,49 @@ func (r *Repository) IsIngested(ctx context.Context, hash string) (bool, error) 
 	return true, nil
 }
 
-func (r *Repository) RecordFile(ctx context.Context, filename, hash string) error {
+func (r *Repository) RecordFile(ctx context.Context, filename, hash string, sizeBytes int64) error {
 	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO file_history (filename, hash) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING`,
-		filename, hash,
+		`INSERT INTO file_history (filename, hash, size_bytes) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING`,
+		filename, hash, sizeBytes,
 	)
 	return err
+}
+
+func (r *Repository) ListUploads(ctx context.Context, page, limit int) (domain.UploadPage, error) {
+	var total int
+	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_history`).Scan(&total); err != nil {
+		return domain.UploadPage{}, err
+	}
+
+	offset := (page - 1) * limit
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, filename, size_bytes, ingested_at
+		 FROM file_history
+		 ORDER BY ingested_at DESC
+		 LIMIT $1 OFFSET $2`,
+		limit, offset,
+	)
+	if err != nil {
+		return domain.UploadPage{}, err
+	}
+	defer rows.Close()
+
+	var items []domain.UploadRecord
+	for rows.Next() {
+		var rec domain.UploadRecord
+		if err := rows.Scan(&rec.ID, &rec.Filename, &rec.SizeBytes, &rec.IngestedAt); err != nil {
+			return domain.UploadPage{}, err
+		}
+		items = append(items, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.UploadPage{}, err
+	}
+	if items == nil {
+		items = []domain.UploadRecord{}
+	}
+
+	return domain.UploadPage{Items: items, Total: total, Page: page, Limit: limit}, nil
 }
 
 func (r *Repository) Reset(ctx context.Context) error {

@@ -17,10 +17,11 @@ import (
 // ── mock service ──────────────────────────────────────────────────────────────
 
 type mockService struct {
-	ingestFn func(ctx context.Context, folder string) (int, error)
-	queryFn  func(ctx context.Context, text string, k int) ([]domain.Document, error)
-	chatFn   func(ctx context.Context, question string, k int) (domain.ChatResponse, error)
-	resetFn  func(ctx context.Context) error
+	ingestFn      func(ctx context.Context, folder string) (int, error)
+	queryFn       func(ctx context.Context, text string, k int) ([]domain.Document, error)
+	chatFn        func(ctx context.Context, question string, k int) (domain.ChatResponse, error)
+	listUploadsFn func(ctx context.Context, page, limit int) (domain.UploadPage, error)
+	resetFn       func(ctx context.Context) error
 }
 
 func (m *mockService) IngestFolder(ctx context.Context, folder string) (int, error) {
@@ -40,6 +41,12 @@ func (m *mockService) Chat(ctx context.Context, question string, k int) (domain.
 		return m.chatFn(ctx, question, k)
 	}
 	return domain.ChatResponse{}, nil
+}
+func (m *mockService) ListUploads(ctx context.Context, page, limit int) (domain.UploadPage, error) {
+	if m.listUploadsFn != nil {
+		return m.listUploadsFn(ctx, page, limit)
+	}
+	return domain.UploadPage{Items: []domain.UploadRecord{}, Total: 0, Page: page, Limit: limit}, nil
 }
 func (m *mockService) Reset(ctx context.Context) error {
 	if m.resetFn != nil {
@@ -70,7 +77,7 @@ func TestIngestMethodNotAllowed(t *testing.T) {
 	srv := newServer(&mockService{})
 	defer srv.Close()
 
-	resp, _ := http.Get(srv.URL + "/ingest?folder=/tmp")
+	resp, _ := http.Get(srv.URL + "/v1/ingest?folder=/tmp")
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", resp.StatusCode)
 	}
@@ -80,7 +87,7 @@ func TestIngestMissingFolder(t *testing.T) {
 	srv := newServer(&mockService{})
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/ingest", "application/json", nil)
+	resp, _ := http.Post(srv.URL+"/v1/ingest", "application/json", nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", resp.StatusCode)
 	}
@@ -97,7 +104,7 @@ func TestIngestSuccess(t *testing.T) {
 	})
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/ingest?folder=/docs", "application/json", nil)
+	resp, _ := http.Post(srv.URL+"/v1/ingest?folder=/docs", "application/json", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
@@ -116,7 +123,7 @@ func TestIngestServiceError(t *testing.T) {
 	})
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/ingest?folder=/docs", "application/json", nil)
+	resp, _ := http.Post(srv.URL+"/v1/ingest?folder=/docs", "application/json", nil)
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", resp.StatusCode)
 	}
@@ -128,7 +135,7 @@ func TestQueryMethodNotAllowed(t *testing.T) {
 	srv := newServer(&mockService{})
 	defer srv.Close()
 
-	resp, _ := http.Get(srv.URL + "/query")
+	resp, _ := http.Get(srv.URL + "/v1/query")
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", resp.StatusCode)
 	}
@@ -138,7 +145,7 @@ func TestQueryInvalidJSON(t *testing.T) {
 	srv := newServer(&mockService{})
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/query", "application/json", strings.NewReader("not json"))
+	resp, _ := http.Post(srv.URL+"/v1/query", "application/json", strings.NewReader("not json"))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", resp.StatusCode)
 	}
@@ -148,7 +155,7 @@ func TestQueryMissingQueryField(t *testing.T) {
 	srv := newServer(&mockService{})
 	defer srv.Close()
 
-	resp := postJSON(t, srv.URL+"/query", map[string]any{"k": 5})
+	resp := postJSON(t, srv.URL+"/v1/query", map[string]any{"k": 5})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", resp.StatusCode)
 	}
@@ -163,7 +170,7 @@ func TestQuerySuccess(t *testing.T) {
 	})
 	defer srv.Close()
 
-	resp := postJSON(t, srv.URL+"/query", map[string]any{"query": "test question", "k": 3})
+	resp := postJSON(t, srv.URL+"/v1/query", map[string]any{"query": "test question", "k": 3})
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
@@ -184,7 +191,7 @@ func TestQueryDefaultKIsFive(t *testing.T) {
 	})
 	defer srv.Close()
 
-	postJSON(t, srv.URL+"/query", map[string]any{"query": "test"})
+	postJSON(t, srv.URL+"/v1/query", map[string]any{"query": "test"})
 	if receivedK != 5 {
 		t.Errorf("expected default k=5, got %d", receivedK)
 	}
@@ -198,7 +205,7 @@ func TestQueryServiceError(t *testing.T) {
 	})
 	defer srv.Close()
 
-	resp := postJSON(t, srv.URL+"/query", map[string]any{"query": "test"})
+	resp := postJSON(t, srv.URL+"/v1/query", map[string]any{"query": "test"})
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", resp.StatusCode)
 	}

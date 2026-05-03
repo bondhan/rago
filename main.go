@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,11 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
 	"rago/internal/handler"
 	"rago/internal/lmstudio"
 	"rago/internal/postgres"
 	"rago/internal/service"
+
+	"github.com/joho/godotenv"
 )
 
 func init() {
@@ -48,11 +50,12 @@ func main() {
 
 	// Transport
 	mux := http.NewServeMux()
-	handler.New(svc).Register(mux)
+	h := handler.New(svc)
+	h.Register(mux)
 
 	srv := &http.Server{
 		Addr:    ":8080",
-		Handler: mux,
+		Handler: h.CORS(mux),
 	}
 
 	// Graceful shutdown on SIGINT / SIGTERM (Ctrl+C)
@@ -61,7 +64,7 @@ func main() {
 
 	go func() {
 		slog.Info("listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}

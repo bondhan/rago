@@ -18,11 +18,12 @@ import (
 // ── mocks ────────────────────────────────────────────────────────────────────
 
 type mockRepo struct {
-	isIngestedFn func(ctx context.Context, hash string) (bool, error)
-	storeChunkFn func(ctx context.Context, filename, chunk string, embedding []float32) error
-	recordFileFn func(ctx context.Context, filename, hash string) error
-	searchFn     func(ctx context.Context, embedding []float32, k int) ([]domain.Document, error)
-	resetFn      func(ctx context.Context) error
+	isIngestedFn  func(ctx context.Context, hash string) (bool, error)
+	storeChunkFn  func(ctx context.Context, filename, chunk string, embedding []float32) error
+	recordFileFn  func(ctx context.Context, filename, hash string, sizeBytes int64) error
+	searchFn      func(ctx context.Context, embedding []float32, k int) ([]domain.Document, error)
+	resetFn       func(ctx context.Context) error
+	listUploadsFn func(ctx context.Context, page, limit int) (domain.UploadPage, error)
 }
 
 func (m *mockRepo) IsIngested(ctx context.Context, hash string) (bool, error) {
@@ -37,11 +38,17 @@ func (m *mockRepo) StoreChunk(ctx context.Context, filename, chunk string, embed
 	}
 	return nil
 }
-func (m *mockRepo) RecordFile(ctx context.Context, filename, hash string) error {
+func (m *mockRepo) RecordFile(ctx context.Context, filename, hash string, sizeBytes int64) error {
 	if m.recordFileFn != nil {
-		return m.recordFileFn(ctx, filename, hash)
+		return m.recordFileFn(ctx, filename, hash, sizeBytes)
 	}
 	return nil
+}
+func (m *mockRepo) ListUploads(ctx context.Context, page, limit int) (domain.UploadPage, error) {
+	if m.listUploadsFn != nil {
+		return m.listUploadsFn(ctx, page, limit)
+	}
+	return domain.UploadPage{Items: []domain.UploadRecord{}, Total: 0, Page: page, Limit: limit}, nil
 }
 func (m *mockRepo) SearchSimilar(ctx context.Context, embedding []float32, k int) ([]domain.Document, error) {
 	if m.searchFn != nil {
@@ -591,7 +598,7 @@ func TestIngestFolderRecordFileError(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "doc.txt"), []byte("content"), 0644)
 
 	svc := newSvc(
-		&mockRepo{recordFileFn: func(_ context.Context, _, _ string) error {
+		&mockRepo{recordFileFn: func(_ context.Context, _, _ string, _ int64) error {
 			return errors.New("record failed")
 		}},
 		&mockEmbedder{},
